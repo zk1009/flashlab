@@ -1,0 +1,46 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Model weights & checkpoints
+checkpoints/
+weights/
+*.pt
+*.pth
+*.safetensors
+*.ckpt
+
+# Data
+data/
+examples/
+
+# PDF
+*.pdf
+
+# Logs
+logs/
+*.log
+wandb/
+runs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Virtual env
+venv/
+.venv/
+env/
+
+# Claude
+.claude/

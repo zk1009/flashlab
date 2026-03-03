@@ -1,0 +1,12 @@
+compute_environment: LOCAL_MACHINE
+distributed_type: MULTI_GPU
+num_processes: 8           # number of GPUs; adjust to your setup
+mixed_precision: bf16      # bfloat16 for stable SDXL training
+gradient_accumulation_steps: 8
+main_process_port: 29500
+machine_rank: 0
+num_machines: 1
+downcast_bf16: 'no'
+use_cpu: false
+dynamo_config:
+  dynamo_backend: 'no'
