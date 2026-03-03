@@ -1,236 +1,213 @@
-# LightLab: Open-Source Reproduction
+# FlashLab
 
-Open-source reproduction of **[LightLab: Controlling Light Sources in Images with Diffusion Models](https://arxiv.org/abs/2505.09608)** (Magar et al., 2025).
+给任意照片添加、去除或调整相机闪光灯效果。基于 SDXL 扩散模型微调，使用闪光灯开/关照片对训练。
 
-## Overview
+受 [LightLab](https://arxiv.org/abs/2505.09608) (Magar et al., 2025) 启发，针对**相机闪光灯场景**做了简化——不需要框选灯具、不需要 SAM 2 分割，只需一张图即可控制闪光灯强度和颜色。
 
-LightLab fine-tunes an SDXL-based diffusion model to enable **parametric control** over visible light sources in photographs:
-- **Intensity control**: Turn lights on/off or adjust brightness
-- **Color control**: Change light color temperature or RGB
-- **Ambient control**: Adjust overall scene illumination
-- **Sequential editing**: Make multiple edits to different light sources
+## 功能
 
-## Architecture
+- **添加闪光灯**：给无闪光的照片加上逼真的闪光灯效果
+- **去除闪光灯**：从闪光灯照片中去除闪光灯痕迹
+- **调节强度**：连续控制闪光灯亮度（gamma 参数）
+- **调节颜色**：自定义闪光灯色温（暖光 / 冷光 / 自定义 RGB）
 
-```
-Input Image ─┐
-              ├─ VAE Encode → image_latent (B, 4, H/8, W/8) ─┐
-Depth Map ───┤                                                 ├─ SpatialConditionEncoder (1×1 conv, zero-init)
-Light Mask ──┤                                                 │   9 channels → 4 channels
-Color Mask ──┘                                                 │
-                                                               ↓
-Noise ─────────────────────────────────────── concat → (B, 8, H/8, W/8)
-                                                               ↓
-                                                      UNet (conv_in: 8→320)
-                                                               ↓
-Ambient α ──┐                                                  │
-Tone-map ───┴─ Fourier Features → MLP → 2 tokens ──→ cross-attention
-                                                               ↓
-                                                      Denoised latent
-                                                               ↓
-                                                      VAE Decode → Output Image
-```
-
-## Project Structure
+## 架构
 
 ```
-lightlab/
-├── data/
-│   ├── light_arithmetic.py     # Core: ichange = clip(ion - ioff, 0), irelit formula
-│   ├── tone_mapping.py         # "separate" and "together" tone mapping
-│   ├── dataset.py              # LightLabDataset (real + synthetic, with inflation)
-│   └── multi_illumination.py   # Multi-Illumination Dataset loader (synthetic substitute)
-├── models/
-│   ├── spatial_encoder.py      # 1×1 Conv2d(9→4), zero-initialized
-│   ├── global_conditioning.py  # FourierFeatures + MLP → 2 cross-attention tokens
-│   ├── unet_lightlab.py        # Modified SDXL UNet: conv_in 4→8 channels
-│   └── pipeline_lightlab.py    # Full inference pipeline
-├── preprocessing/
-│   ├── depth_extractor.py      # Depth Anything V2 wrapper
-│   └── segmentation.py         # SAM 2 wrapper for light source segmentation
-├── training/
-│   └── train.py                # Multi-GPU training with HuggingFace Accelerate
-├── inference/
-│   └── infer.py                # CLI inference script
-├── demo/
-│   └── app.py                  # Gradio web demo
-├── scripts/
-│   └── preprocess_real_pairs.py # Offline depth/mask extraction
-└── configs/
-    └── accelerate_config.yaml   # Multi-GPU training config
+Input Image ──── VAE Encode ──── image_latent (4ch) ─┐
+                                                      ├─ SpatialEncoder (1×1 conv) → 4ch
+Depth Map ───────────────────────────── depth  (1ch) ─┤
+Flash Mask ──────────────────── mask × gamma   (1ch) ─┤    (flash = 全图 mask)
+Flash Color ─────────────────── mask × ct_rgb  (3ch) ─┘
+                                                      ↓
+Noise (4ch) ──────────────────────── concat → UNet input (8ch)
+                                                      ↓
+                                                 SDXL UNet
+                                                      ↓
+Ambient α ──┐                                         │
+Tone-map ───┴─ Fourier → MLP → 2 tokens ──→ cross-attention
+                                                      ↓
+                                              VAE Decode → Output
 ```
 
-## Setup
+## 快速开始
 
-### 1. Install Dependencies
+### 1. 安装
 
 ```bash
-pip install -r requirements.txt
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+pip install diffusers transformers accelerate xformers
+pip install opencv-python Pillow numpy scipy tqdm tensorboard gradio
 ```
 
-For SAM 2:
-```bash
-pip install git+https://github.com/facebookresearch/sam2.git
+### 2. 准备数据
+
+用手机 / 相机 + 三脚架拍摄同一场景的闪光灯开/关照片对：
+
 ```
-
-### 2. Download Model Weights
-
-**Base SDXL model** (downloaded automatically by HuggingFace):
-```bash
-huggingface-cli download stabilityai/stable-diffusion-xl-base-1.0
-```
-
-**SAM 2 checkpoint**:
-```bash
-mkdir -p checkpoints
-wget -P checkpoints https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt
-mv checkpoints/sam2.1_hiera_large.pt checkpoints/sam2_hiera_large.pt
-```
-
-**Depth Anything V2** (downloaded automatically via HuggingFace Transformers).
-
-### 3. Prepare Training Data
-
-#### Option A: Use Multi-Illumination Dataset (recommended)
-
-```bash
-# Download from MIT CSAIL: https://projects.csail.mit.edu/illumination/
-# Extract to ./data/multi_illumination/
-```
-
-#### Option B: Capture your own real pairs
-
-Organize as:
-```
-data/real_pairs/
+data/flash_pairs/
     scene_001/
-        on.jpg      # image with light source ON
-        off.jpg     # image with light source OFF (ambient)
-        bbox.json   # {"bbox": [x1, y1, x2, y2]} — optional, for SAM 2 masks
+        flash.jpg       ← 开闪光灯
+        noflash.jpg     ← 关闪光灯
     scene_002/
-        ...
+        flash.jpg
+        noflash.jpg
+    ...
 ```
 
-### 4. Preprocess (cache depth maps and masks)
+### 3. 预处理（提取深度图）
 
 ```bash
-python scripts/preprocess_real_pairs.py \
-    --data_root ./data/real_pairs \
-    --depth_cache_dir ./data/depth_cache \
-    --mask_cache_dir ./data/mask_cache \
-    --image_size 1024
+python scripts/preprocess_flash_pairs.py \
+    --data_root ./data/flash_pairs \
+    --depth_cache_dir ./data/depth_cache
 ```
 
-## Training
-
-### Multi-GPU (8 GPUs, effective batch = 128)
+### 4. 训练
 
 ```bash
+# 多卡
 accelerate launch --config_file configs/accelerate_config.yaml \
-    training/train.py \
-    --output_dir ./checkpoints \
-    --real_data_root ./data/real_pairs \
-    --synthetic_data_root ./data/multi_illumination \
+    training/train_flash.py \
+    --flash_data_root ./data/flash_pairs \
     --depth_cache_dir ./data/depth_cache \
-    --mask_cache_dir ./data/mask_cache \
-    --per_device_batch_size 2 \
-    --gradient_accumulation_steps 8 \
-    --max_train_steps 45000 \
-    --learning_rate 1e-5 \
-    --mixed_precision bf16
-```
-
-### Single GPU (smaller scale)
-
-```bash
-accelerate launch --num_processes 1 \
-    training/train.py \
     --output_dir ./checkpoints \
-    --synthetic_data_root ./data/multi_illumination \
+    --max_train_steps 30000
+
+# 单卡 (24GB)
+accelerate launch --num_processes 1 \
+    training/train_flash.py \
+    --flash_data_root ./data/flash_pairs \
+    --depth_cache_dir ./data/depth_cache \
+    --output_dir ./checkpoints \
     --per_device_batch_size 1 \
     --gradient_accumulation_steps 128 \
-    --max_train_steps 45000 \
-    --learning_rate 1e-5 \
-    --mixed_precision bf16 \
     --enable_gradient_checkpointing
 ```
 
-> **Memory tip**: Use `--per_device_batch_size 1` and `--enable_gradient_checkpointing` on a 24GB GPU. Expect ~20GB VRAM usage.
-
-## Inference
-
-### Command Line
+### 5. 推理
 
 ```bash
-python inference/infer.py \
-    --checkpoint checkpoints/lightlab_step045000.pt \
-    --image examples/room.jpg \
-    --bbox 220 180 340 290 \
+# 加闪光灯
+python inference/infer_flash.py \
+    --checkpoint checkpoints/checkpoint_030000.pt \
+    --image photo.jpg \
     --gamma 1.0 \
-    --output room_lit.jpg
+    --output photo_flash.jpg
 
-# Turn off a light:
-python inference/infer.py --image room.jpg --bbox 220 180 340 290 --gamma -1.0 ...
+# 去闪光灯
+python inference/infer_flash.py \
+    --checkpoint checkpoints/checkpoint_030000.pt \
+    --image flash_photo.jpg \
+    --gamma -1.0 \
+    --output photo_noflash.jpg
 
-# Change color to warm light:
-python inference/infer.py --image room.jpg --bbox 220 180 340 290 --gamma 1.0 --color 255 150 50 ...
+# 暖色闪光灯
+python inference/infer_flash.py \
+    --checkpoint checkpoints/checkpoint_030000.pt \
+    --image photo.jpg \
+    --gamma 0.8 \
+    --color 255 180 100 \
+    --output photo_warm_flash.jpg
 ```
 
-### Gradio Web Demo
+### 6. Web Demo
 
 ```bash
-python demo/app.py --checkpoint checkpoints/lightlab_step045000.pt --port 7860
+python demo/app_flash.py \
+    --checkpoint checkpoints/checkpoint_030000.pt \
+    --port 7860
 ```
 
-### Python API
+## Python API
 
 ```python
 from PIL import Image
-from models.pipeline_lightlab import LightLabPipeline
+from models.pipeline_flash import FlashLabPipeline
 
-pipeline = LightLabPipeline.from_checkpoint("checkpoints/lightlab_step045000.pt")
+pipeline = FlashLabPipeline.from_checkpoint("checkpoints/checkpoint_030000.pt")
 
 result = pipeline(
-    image=Image.open("room.jpg"),
-    bbox=[220, 180, 340, 290],  # bounding box around the lamp
-    gamma=1.0,                   # turn on fully
-    alpha=0.0,                   # no ambient change
-    ct_rgb=[1.0, 0.6, 0.2],     # warm orange color
-    tonemap="together",
-    num_inference_steps=15,
+    image=Image.open("photo.jpg"),
+    gamma=0.8,                     # 闪光灯强度
+    ct_rgb=[1.0, 0.85, 0.7],      # 暖色闪光
+    alpha=0.0,                     # 环境光不变
 )
-result.save("room_lit.jpg")
+result.save("photo_flash.jpg")
 ```
 
-## Key Implementation Notes
+## 参数说明
 
-### Light Arithmetic (Section 3.2)
-```python
-ichange = clip(ion - ioff, 0)                            # extract light contribution
-c = ct ⊙ co^{-1}                                         # color change coefficient
-irelit(α, γ, ct) = α · iamb + γ · ichange · c           # Eq. 1
+| 参数 | 范围 | 说明 |
+|------|------|------|
+| `gamma` | [-1, 1] | 闪光灯强度。1.0 = 全开，0 = 不变，-1.0 = 去除闪光 |
+| `alpha` | [-1, 1] | 环境光变化。0 = 不变，正值 = 增亮，负值 = 变暗 |
+| `color` | [0-255] RGB | 闪光灯颜色。不填 = 白色中性闪光 |
+| `tonemap` | together / separate | 色调映射策略。together = 保持亮度关系一致 |
+| `steps` | 5-50 | DDIM 去噪步数，默认 15 |
+
+## 项目结构
+
+```
+flashlab/
+├── data/
+│   ├── flash_dataset.py       # 闪光灯数据集（mask=全图）
+│   ├── light_arithmetic.py    # 光线算术公式
+│   └── tone_mapping.py        # 色调映射
+├── models/
+│   ├── pipeline_flash.py      # 推理 Pipeline（无需 SAM 2）
+│   ├── spatial_encoder.py     # 空间条件编码（1×1 conv）
+│   ├── global_conditioning.py # 全局条件（Fourier + MLP）
+│   └── unet_lightlab.py       # 修改版 SDXL UNet（8通道输入）
+├── training/
+│   └── train_flash.py         # 训练脚本
+├── inference/
+│   └── infer_flash.py         # 命令行推理
+├── demo/
+│   └── app_flash.py           # Gradio Demo
+├── preprocessing/
+│   └── depth_extractor.py     # Depth Anything V2 深度估计
+└── scripts/
+    └── preprocess_flash_pairs.py  # 数据预处理
 ```
 
-### UNet Channel Expansion
-- Original SDXL `conv_in`: `Conv2d(4, 320, 3×3)`
-- Modified: `Conv2d(8, 320, 3×3)`
-- Pretrained weights copied to channels 0–3 (noise), zeros at channels 4–7 (spatial conditions)
-- Zero-init for spatial conditions ensures training stability (same principle as ControlNet)
+## 技术细节
 
-### Condition Dropout (Section 3.4)
-- Depth and color conditions dropped with 10% probability during training
-- Allows the model to work without depth/color at inference time
+### Light Arithmetic
 
-## Deviations from Paper
+从闪光灯开/关照片对中提取闪光灯贡献，再通过线性组合生成不同强度/颜色的训练样本：
 
-| Paper | This Reproduction |
-|-------|-------------------|
-| Proprietary SDXL variant (trained on PaLI subset) | Public `stabilityai/stable-diffusion-xl-base-1.0` |
-| 600 real photo pairs (proprietary) | User-provided pairs + Multi-Illumination dataset |
-| 20 Blender scenes (~600K synthetic) | Multi-Illumination dataset (~24K pairs × 36 inflation) |
-| 64 TPU v4s, 12 hours | 8 GPUs (estimated 2–5 days) |
+```
+flash_contribution = clip(flash_on - flash_off, 0)
+output = alpha * ambient + gamma * flash_contribution * color_coeff
+```
 
-## Citation
+每对照片通过采样不同的 (gamma, alpha, color) 组合，膨胀为 ~30 个训练样本。
+
+### 深度条件
+
+使用 Depth Anything V2 提取单目深度图，帮助模型学习闪光灯的距离衰减特性（近亮远暗）。
+
+### 训练策略
+
+- 基座模型：SDXL (Stable Diffusion XL)
+- UNet 输入通道：4 → 8（前 4 通道复制预训练权重，后 4 通道零初始化）
+- 条件 Dropout：10% 概率丢弃深度 / 颜色条件，提升鲁棒性
+- 损失：MSE + Min-SNR 加权
+- 精度：bfloat16
+
+## 硬件需求
+
+| 用途 | 最低配置 | 推荐配置 |
+|------|---------|---------|
+| 推理 | 1× RTX 3090 (24GB) | 1× RTX 4090 |
+| 训练 | 1× RTX 4090 (24GB) | 4-8× A100 (80GB) |
+
+单卡训练预计时间：~1-2 周（30K 步）。多卡可线性加速。
+
+## Acknowledgments
+
+本项目基于 [LightLab](https://arxiv.org/abs/2505.09608) 的方法进行实现和改造。
 
 ```bibtex
 @article{magar2025lightlab,
